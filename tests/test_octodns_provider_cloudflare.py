@@ -1005,7 +1005,7 @@ class TestCloudflareProvider(TestCase):
         # Set things up to preexist/mock as necessary
         zone = Zone('unit.tests.', [])
         # Stuff a fake zone id in place
-        provider._zones = {zone.name: '42'}
+        provider._zones = {zone.name: {'id': '42'}}
         provider._request = Mock()
         side_effect = [
             {
@@ -2891,3 +2891,313 @@ class TestCloudflareProvider(TestCase):
         msg = str(ctx.exception)
         self.assertTrue('subber.unit.tests.' in msg)
         self.assertTrue('coresponding NS record' in msg)
+
+    def test_plan_handling(self):
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider.pagerules = False  # disable pagerules to avoid extra requests
+
+        # Mock the _try_request method
+        provider._try_request = Mock()
+
+        # Test 1: Creating a new zone with plan
+        provider._try_request.side_effect = [
+            {
+                # GET /zones response (empty)
+                'result': [],
+                'result_info': {'count': 0, 'per_page': 50},
+            },
+            {
+                # POST /zones response
+                'result': {
+                    'id': '42',
+                    'name': 'unit.tests',
+                    'plan': {'legacy_id': 'enterprise'},
+                }
+            },
+            {
+                # POST /zones/42/dns_records response
+                'result': {
+                    'id': 'record-id',
+                    'type': 'A',
+                    'name': 'new.unit.tests',
+                    'content': '1.2.3.4',
+                    'ttl': 300,
+                }
+            },
+        ]
+
+        zone = Zone('unit.tests.', [])
+        zone.add_record(
+            Record.new(
+                zone, 'new', {'ttl': 300, 'type': 'A', 'value': '1.2.3.4'}
+            )
+        )
+
+        plan = provider.plan(zone)
+        provider.apply(plan)
+
+        # Verify zone creation included plan data
+        provider._try_request.assert_has_calls(
+            [
+                call(
+                    'GET',
+                    '/zones',
+                    params={
+                        'page': 1,
+                        'per_page': 50,
+                        'account.id': 'account_id',
+                    },
+                ),
+                call(
+                    'POST',
+                    '/zones',
+                    data={
+                        'name': 'unit.tests',
+                        'jump_start': False,
+                        'account': {'id': 'account_id'},
+                        'plan': {'legacy_id': 'enterprise'},
+                    },
+                ),
+                call(
+                    'POST',
+                    '/zones/42/dns_records',
+                    data={
+                        'content': '1.2.3.4',
+                        'name': 'new.unit.tests',
+                        'type': 'A',
+                        'ttl': 300,
+                        'proxied': False,
+                    },
+                ),
+            ]
+        )
+
+        # Test 2: Updating existing zone's plan
+        provider._zones = None  # Clear cache
+        provider._try_request.reset_mock()
+        provider._try_request.side_effect = [
+            {
+                # GET /zones response
+                'result': [
+                    {
+                        'id': '42',
+                        'name': 'unit.tests',
+                        'plan': {'legacy_id': 'pro'},
+                    }
+                ],
+                'result_info': {'count': 1, 'per_page': 50},
+            },
+            {
+                # GET /zones/42/dns_records response
+                'result': [],
+                'result_info': {'count': 0, 'per_page': 100},
+            },
+            {
+                # GET /zones/42/available_plans
+                'result': [{'legacy_id': 'pro'}, {'legacy_id': 'enterprise'}]
+            },
+            {
+                # PATCH /zones/42 (plan update)
+                'result': {
+                    'id': '42',
+                    'name': 'unit.tests',
+                    'plan': {'legacy_id': 'enterprise'},
+                }
+            },
+            {
+                # POST /zones/42/dns_records
+                'result': {
+                    'id': 'record-id',
+                    'type': 'A',
+                    'name': 'existing.unit.tests',
+                    'content': '1.2.3.4',
+                    'ttl': 300,
+                }
+            },
+        ]
+
+        zone = Zone('unit.tests.', [])
+        zone.add_record(
+            Record.new(
+                zone, 'existing', {'ttl': 300, 'type': 'A', 'value': '1.2.3.4'}
+            )
+        )
+
+        plan = provider.plan(zone)
+        provider.apply(plan)
+
+        # Verify plan update calls
+        provider._try_request.assert_has_calls(
+            [
+                # Get zones to populate cache
+                call(
+                    'GET',
+                    '/zones',
+                    params={
+                        'page': 1,
+                        'per_page': 50,
+                        'account.id': 'account_id',
+                    },
+                ),
+                # Get existing records
+                call(
+                    'GET',
+                    '/zones/42/dns_records',
+                    params={'page': 1, 'per_page': 100},
+                ),
+                # Then check available plans
+                call('GET', '/zones/42/available_plans'),
+                # Update the plan
+                call(
+                    'PATCH',
+                    '/zones/42',
+                    data={'plan': {'legacy_id': 'enterprise'}},
+                ),
+                # Create the new record
+                call(
+                    'POST',
+                    '/zones/42/dns_records',
+                    data={
+                        'content': '1.2.3.4',
+                        'name': 'existing.unit.tests',
+                        'type': 'A',
+                        'ttl': 300,
+                        'proxied': False,
+                    },
+                ),
+            ]
+        )
+
+        # Test 3: No plan update needed when current plan matches desired plan
+        provider._zones = None  # Clear cache
+        provider._try_request.reset_mock()
+        provider._try_request.side_effect = [
+            {
+                # GET /zones response
+                'result': [
+                    {
+                        'id': '42',
+                        'name': 'unit.tests',
+                        'plan': {'legacy_id': 'enterprise'},
+                    }
+                ],
+                'result_info': {'count': 1, 'per_page': 50},
+            },
+            {
+                # GET /zones/42/dns_records response
+                'result': [],
+                'result_info': {'count': 0, 'per_page': 100},
+            },
+            {
+                # POST /zones/42/dns_records
+                'result': {
+                    'id': 'record-id',
+                    'type': 'A',
+                    'name': 'existing.unit.tests',
+                    'content': '1.2.3.4',
+                    'ttl': 300,
+                }
+            },
+        ]
+
+        plan = provider.plan(zone)
+        provider.apply(plan)
+
+        # Verify only zones list was fetched, no other calls needed
+        provider._try_request.assert_has_calls(
+            [
+                call(
+                    'GET',
+                    '/zones',
+                    params={
+                        'page': 1,
+                        'per_page': 50,
+                        'account.id': 'account_id',
+                    },
+                ),
+                call(
+                    'GET',
+                    '/zones/42/dns_records',
+                    params={'page': 1, 'per_page': 100},
+                ),
+                call(
+                    'POST',
+                    '/zones/42/dns_records',
+                    data={
+                        'content': '1.2.3.4',
+                        'name': 'existing.unit.tests',
+                        'type': 'A',
+                        'ttl': 300,
+                        'proxied': False,
+                    },
+                ),
+            ]
+        )
+
+        # Test 4: Plan update fails when available plans can't be determined
+        provider._zones = None  # Clear cache
+        provider._try_request.reset_mock()
+        provider._try_request.side_effect = [
+            {
+                # GET /zones response
+                'result': [
+                    {
+                        'id': '42',
+                        'name': 'unit.tests',
+                        'plan': {'legacy_id': 'pro'},
+                    }
+                ],
+                'result_info': {'count': 1, 'per_page': 50},
+            },
+            {
+                # GET /zones/42/dns_records response
+                'result': [],
+                'result_info': {'count': 0, 'per_page': 100},
+            },
+            {
+                # GET /zones/42/available_plans returns no plans
+                'result': [],
+                'result_info': {'count': 0, 'per_page': 100},
+            },
+        ]
+
+        with self.assertRaises(SupportsException) as ctx:
+            plan = provider.plan(zone)
+            provider.apply(plan)
+
+        self.assertEqual(
+            'test: unable to determine supported plans, do you have an Enterprise account?',
+            str(ctx.exception),
+        )
+
+        # Test 5: Plan update fails when desired plan isn't available
+        provider._zones = None  # Clear cache
+        provider._try_request.reset_mock()
+        provider._try_request.side_effect = [
+            {
+                # GET /zones response
+                'result': [
+                    {
+                        'id': '42',
+                        'name': 'unit.tests',
+                        'plan': {'legacy_id': 'pro'},
+                    }
+                ],
+                'result_info': {'count': 1, 'per_page': 50},
+            },
+            {
+                # GET /zones/42/available_plans returns only pro plan
+                'result': [{'legacy_id': 'pro'}]
+            },
+        ]
+
+        with self.assertRaises(SupportsException) as ctx:
+            plan = provider.plan(zone)
+            provider.apply(plan)
+
+        self.assertEqual(
+            'test: enterprise is not supported for unit.tests.',
+            str(ctx.exception),
+        )
