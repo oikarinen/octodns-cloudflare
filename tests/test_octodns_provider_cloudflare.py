@@ -12,7 +12,7 @@ from requests_mock import mock as requests_mock
 
 from octodns.idna import idna_encode
 from octodns.provider import SupportsException
-from octodns.provider.base import Plan
+from octodns.provider.base import Plan as _Plan
 from octodns.provider.yaml import YamlProvider
 from octodns.record import Create, Delete, Record, Update
 from octodns.zone import Zone
@@ -2910,3 +2910,12 @@ class TestCloudflareProvider(TestCase):
         msg = str(ctx.exception)
         self.assertTrue('subber.unit.tests.' in msg)
         self.assertTrue('coresponding NS record' in msg)
+
+
+# temporarily override Plan to add meta attribute, until octodns dependency is updated
+# with https://github.com/octodns/octodns/pull/1236
+class Plan(_Plan):
+
+    def __init__(self, existing, desired, changes, exists, meta=None):
+        super().__init__(existing, desired, changes, exists)
+        self.meta = meta if meta else {}
