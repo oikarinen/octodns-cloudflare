@@ -12,12 +12,13 @@ from requests_mock import mock as requests_mock
 
 from octodns.idna import idna_encode
 from octodns.provider import SupportsException
-from octodns.provider.base import Plan
+from octodns.provider.base import Plan as _Plan
 from octodns.provider.yaml import YamlProvider
 from octodns.record import Create, Delete, Record, Update
 from octodns.zone import Zone
 
 from octodns_cloudflare import (
+    CLOUDFLARE_FREE_PLAN,
     CloudflareAuthenticationError,
     CloudflareProvider,
     CloudflareRateLimitError,
@@ -1024,7 +1025,7 @@ class TestCloudflareProvider(TestCase):
         # Set things up to preexist/mock as necessary
         zone = Zone('unit.tests.', [])
         # Stuff a fake zone id in place
-        provider._zones = {zone.name: '42'}
+        provider._zones = {zone.name: {'id': '42'}}
         provider._request = Mock()
         side_effect = [
             {
@@ -2910,3 +2911,315 @@ class TestCloudflareProvider(TestCase):
         msg = str(ctx.exception)
         self.assertTrue('subber.unit.tests.' in msg)
         self.assertTrue('coresponding NS record' in msg)
+
+    def test_meta(self):
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._try_request = Mock()
+
+        # Test 1: Creating new zone with plan_type
+        provider._try_request.side_effect = [
+            {
+                # GET /zones response (empty)
+                'result': [],
+                'result_info': {'count': 0, 'per_page': 50},
+            },
+            {
+                # POST /zones response
+                'result': {'id': '42', 'plan': {'legacy_id': 'enterprise'}},
+                'result_info': {'count': 1, 'per_page': 50},
+            },
+        ]
+
+        zone = Zone('unit.tests.', [])
+        plan = Plan(zone, zone, [], True)
+        provider._apply(plan)
+
+        provider._try_request.assert_has_calls(
+            [
+                call(
+                    'GET',
+                    '/zones',
+                    params={
+                        'page': 1,
+                        'per_page': 50,
+                        'account.id': 'account_id',
+                    },
+                ),
+                call(
+                    'POST',
+                    '/zones',
+                    data={
+                        'name': 'unit.tests',
+                        'jump_start': False,
+                        'account': {'id': 'account_id'},
+                        'plan': {'legacy_id': 'enterprise'},
+                    },
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            provider.zones['unit.tests.'], {'id': '42', 'plan': 'enterprise'}
+        )
+
+        # Reset for next test
+        provider._try_request.reset_mock()
+
+        # Test 2: Plan update when current plan differs
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'pro'}}
+
+        existing = Zone('unit.tests.', [])
+        desired = Zone('unit.tests.', [])
+
+        provider._try_request.side_effect = [
+            {'result': [{'legacy_id': 'pro'}, {'legacy_id': 'enterprise'}]},
+            {
+                # PATCH /zones/42 (plan update)
+                'result': {'plan': {'legacy_id': 'enterprise'}}
+            },
+        ]
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({'cloudflare_plan': 'enterprise'}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+        provider.apply(plan)
+
+        provider._try_request.assert_has_calls(
+            [
+                call('GET', '/zones/42/available_plans'),
+                call(
+                    'PATCH',
+                    '/zones/42',
+                    data={'plan': {'legacy_id': 'enterprise'}},
+                ),
+            ]
+        )
+
+        # Test 3: Plan removal sets to free plan
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type=None
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'pro'}}
+        provider._try_request = Mock()
+        provider._try_request.side_effect = [
+            {
+                'result': [
+                    {'legacy_id': 'pro'},
+                    {'legacy_id': CLOUDFLARE_FREE_PLAN},
+                ]
+            },
+            {'result': {'plan': {'legacy_id': CLOUDFLARE_FREE_PLAN}}},
+        ]
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({'cloudflare_plan': CLOUDFLARE_FREE_PLAN}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+        provider.apply(plan)
+
+        provider._try_request.assert_has_calls(
+            [
+                call('GET', '/zones/42/available_plans'),
+                call(
+                    'PATCH',
+                    '/zones/42',
+                    data={'plan': {'legacy_id': CLOUDFLARE_FREE_PLAN}},
+                ),
+            ]
+        )
+
+        # Test 4: No plan update when current plan matches desired plan
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'enterprise'}}
+        provider._try_request = Mock()
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({}, meta)  # No meta changes when plans match
+
+        # Test 5: Unsupported plan raises SupportsException
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='unsupported_plan'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'pro'}}
+        provider._try_request = Mock()
+        provider._try_request.side_effect = [
+            {'result': [{'legacy_id': 'pro'}, {'legacy_id': 'enterprise'}]}
+        ]
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({'cloudflare_plan': 'unsupported_plan'}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+
+        with self.assertRaises(SupportsException) as ctx:
+            provider.apply(plan)
+
+        self.assertEqual(
+            'test: unsupported_plan is not supported for unit.tests.',
+            str(ctx.exception),
+        )
+
+        provider._try_request.assert_called_once_with(
+            'GET', '/zones/42/available_plans'
+        )
+
+        # Test 6: No API calls when current plan matches desired plan
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'enterprise'}}
+        provider._try_request = Mock()
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({}, meta)  # No meta changes when plans match
+        plan = Plan(existing, desired, [], True, meta=meta)
+        provider.apply(plan)
+
+        provider._try_request.assert_not_called()  # No API calls should be made
+
+        # Test 7: Enterprise check error handling
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'pro'}}
+        provider._try_request = Mock()
+        provider._try_request.side_effect = [
+            {'result': None}
+        ]  # Invalid response
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({'cloudflare_plan': 'enterprise'}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+
+        with self.assertRaises(SupportsException) as ctx:
+            provider.apply(plan)
+
+        self.assertEqual(
+            'test: unable to determine supported plans, do you have an Enterprise account?',
+            str(ctx.exception),
+        )
+
+        provider._try_request.assert_called_once_with(
+            'GET', '/zones/42/available_plans'
+        )
+
+        # Test 8: Early return when current plan matches desired plan
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'enterprise'}}
+        provider._try_request = Mock()
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({}, meta)  # No meta changes when plans match
+        plan = Plan(existing, desired, [], True, meta=meta)
+        provider.apply(plan)
+
+        provider._try_request.assert_not_called()  # No API calls should be made
+
+        # Test 9: Unsupported plan raises SupportsException
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='unsupported_plan'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'pro'}}
+        provider._try_request = Mock()
+        provider._try_request.side_effect = [
+            {'result': [{'legacy_id': 'pro'}, {'legacy_id': 'enterprise'}]}
+        ]
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({'cloudflare_plan': 'unsupported_plan'}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+
+        with self.assertRaises(SupportsException) as ctx:
+            provider.apply(plan)
+
+        self.assertEqual(
+            'test: unsupported_plan is not supported for unit.tests.',
+            str(ctx.exception),
+        )
+
+        provider._try_request.assert_called_once_with(
+            'GET', '/zones/42/available_plans'
+        )
+
+        # Test 10: Available plans API call failure
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'pro'}}
+        provider._try_request = Mock()
+        provider._try_request.side_effect = [
+            {'result': None}
+        ]  # Invalid response
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({'cloudflare_plan': 'enterprise'}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+
+        with self.assertRaises(SupportsException) as ctx:
+            provider.apply(plan)
+
+        self.assertEqual(
+            'test: unable to determine supported plans, do you have an Enterprise account?',
+            str(ctx.exception),
+        )
+
+        provider._try_request.assert_called_once_with(
+            'GET', '/zones/42/available_plans'
+        )
+
+        # Test 11: Early return in _update_plan when plans match
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {'unit.tests.': {'id': '42', 'plan': 'enterprise'}}
+        provider._supported_plans = Mock()  # This shouldn't be called
+        provider._try_request = Mock()  # This shouldn't be called
+
+        # Call _update_plan directly with matching plans
+        provider._update_plan('unit.tests.', 'enterprise')
+
+        # Verify no API calls were made since plans match
+        provider._supported_plans.assert_not_called()
+        provider._try_request.assert_not_called()
+
+        # Test 12: Plan meta when zone doesn't exist
+        provider = CloudflareProvider(
+            'test', 'email', 'token', 'account_id', plan_type='enterprise'
+        )
+        provider._zones = {}  # No zones at all
+        provider._try_request = Mock()
+
+        meta = provider._plan_meta(existing, desired, [])
+        self.assertEqual({}, meta)
+        plan = Plan(existing, desired, [], True, meta=meta)
+
+        provider._try_request.side_effect = [
+            {
+                'result': {'id': '42', 'plan': {'legacy_id': 'enterprise'}},
+                'result_info': {'count': 1, 'per_page': 50}
+            }
+        ]
+
+        provider.apply(plan)
+
+        provider._try_request.assert_has_calls([
+            call('POST', '/zones', data={
+                'name': 'unit.tests',
+                'jump_start': False,
+                'account': {'id': 'account_id'},
+                'plan': {'legacy_id': 'enterprise'}
+            })
+        ])
+
+
+# temporarily override Plan to add meta attribute, until octodns dependency is updated
+# with https://github.com/octodns/octodns/pull/1236
+class Plan(_Plan):
+
+    def __init__(self, existing, desired, changes, exists, meta=None):
+        super().__init__(existing, desired, changes, exists)
+        self.meta = meta if meta else {}
